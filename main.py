@@ -193,3 +193,36 @@ def download_url(url: str, out_folder: str, session: requests.Session | None = N
     except Exception as e:
         print('Error writing file', out_path, e)
         return None
+
+
+        # ---------- ПОИСК 3D-ССЫЛОК В HTML ----------
+
+def find_3d_urls_from_html(page_url: str, html: str) -> set[str]:
+    soup = BeautifulSoup(html, 'html.parser')
+    found: set[str] = set()
+
+    for tag in soup.find_all(['a', 'link'], href=True):
+        full = urljoin(page_url, tag.get('href') or '')
+        if is_3d_url(full):
+            found.add(full)
+
+    for tag in soup.find_all(['img', 'source', 'script'], src=True):
+        full = urljoin(page_url, tag.get('src') or '')
+        if is_3d_url(full):
+            found.add(full)
+
+    # data-* и прочие атрибуты, куда могли положить путь к модели
+    for t in soup.find_all(True):
+        for _, val in t.attrs.items():
+            if isinstance(val, str) and is_3d_url(val):
+                found.add(urljoin(page_url, val))
+
+    # Явные вхождения расширений в тексте
+    for m in re.finditer(r'["\']([^"\']+\.(?:gltf|glb|obj|stl|ply|fbx)(?:\?[^"\']*)?)["\']', html, re.IGNORECASE):
+        found.add(urljoin(page_url, m.group(1)))
+
+    # data:...;base64,...
+    for m in re.finditer(r'(data:[^,]+;base64,[A-Za-z0-9+/=]+)', html):
+        found.add(m.group(1))
+
+    return found
