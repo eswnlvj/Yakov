@@ -9,6 +9,9 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
+from seleniumwire import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import WebDriverException
 
 # --- Настройки ---
 EXTS = ('.gltf', '.glb', '.obj', '.stl', '.ply', '.fbx')  # поддерживаемые расширения 3D
@@ -29,7 +32,6 @@ def default_download_root() -> Path:
 
 
 DEFAULT_DOWNLOAD_FOLDER = str(default_download_root())
-
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 
@@ -69,7 +71,7 @@ def is_3d_url(u: str) -> bool:
     return any(p.endswith(ext) for ext in EXTS)
 
 
-    # ---------- СОХРАНЕНИЕ АРТЕФАКТОВ (ГАРАНТИРУЕТ ФАЙЛЫ) ----------
+# ---------- СОХРАНЕНИЕ АРТЕФАКТОВ (ГАРАНТИРУЕТ ФАЙЛЫ) ----------
 
 def save_page_artifacts(driver, out_folder: str, page_url: str) -> dict:
     ts = time.strftime('%Y%m%d_%H%M%S')
@@ -102,9 +104,9 @@ def save_page_artifacts(driver, out_folder: str, page_url: str) -> dict:
     artifacts['manifest'] = manifest_path
 
     return artifacts
-    
-    
-    # ---------- СКАЧИВАНИЕ ----------
+
+
+# ---------- СКАЧИВАНИЕ ----------
 
 _CD_RE = re.compile(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', re.IGNORECASE)
 
@@ -195,7 +197,7 @@ def download_url(url: str, out_folder: str, session: requests.Session | None = N
         return None
 
 
-        # ---------- ПОИСК 3D-ССЫЛОК В HTML ----------
+# ---------- ПОИСК 3D-ССЫЛОК В HTML ----------
 
 def find_3d_urls_from_html(page_url: str, html: str) -> set[str]:
     soup = BeautifulSoup(html, 'html.parser')
@@ -226,6 +228,117 @@ def find_3d_urls_from_html(page_url: str, html: str) -> set[str]:
         found.add(m.group(1))
 
     return found
+
+
+# ---------- ОСНОВНАЯ ЛОГИКА ----------
+
+def parse_dynamic_page(page_url: str,
+                       out_folder: str = DEFAULT_DOWNLOAD_FOLDER,
+                       wait: int = DEFAULT_WAIT,
+                       save_artifacts: bool = True,
+                       marker_on_empty: bool = True) -> list[str]:
+    out_folder = resolve_out_folder(out_folder)
+    ensure_folder(out_folder)
+
+    chrome_opts = Options()
+    chrome_opts.add_argument('--headless=new')
+    chrome_opts.add_argument('--disable-gpu')
+    chrome_opts.add_argument('--no-sandbox')
+    chrome_opts.add_argument('--disable-dev-shm-usage')
+    chrome_opts.add_argument('--disable-blink-features=AutomationControlled')
+    chrome_opts.add_argument(f'--user-agent={USER_AGENT}')
+
+    try:
+        driver = webdriver.Chrome(options=chrome_opts)
+    except WebDriverException as e:
+        print('Error starting Chrome driver:', e)
+        print('Убедитесь, что Chrome/ChromeDriver установлены и совместимы.')
+        return []
+
+    session = requests.Session()
+    session.headers.update({'User-Agent': USER_AGENT})
+
+    try:
+        print('Opening page:', page_url)
+        driver.scopes = ['.*']
+        driver.get(page_url)
+        print(f'Waiting {wait} seconds for dynamic content to load...')
+        time.sleep(wait)
+
+        results: list[str] = []
+
+        if save_artifacts:
+            artifacts = save_page_artifacts(driver, out_folder, page_url)
+            results.extend(artifacts.values())
+
+        print('Scanning network requests...')
+        found = set()
+        for req in driver.requests:
+            try:
+                if is_3d_url(req.url):
+                    found.add(req.url)
+            except Exception:
+                continue
+
+        print('Scanning page HTML...')
+        html = driver.page_source
+        found.update(find_3d_urls_from_html(page_url, html))
+        print('Found', len(found), 'candidate 3D URLs')
+
+        for url in sorted(found):
+            saved = download_url(url, out_folder, session=session)
+            if saved:
+                results.append(saved)
+
+        if not any(Path(p).suffix.lower() in EXTS for p in results) and marker_on_empty:
+            marker = unique_path(os.path.join(out_folder, 'NO_3D_FOUND.txt'))
+            with open(marker, 'w', encoding='utf-8') as f:
+                f.write(f'URL: {page_url}\n3D-расширения: {", ".join(EXTS)}\nНа странице не найдены 3D-ресурсы.')
+            results.append(marker)
+            print('Created marker ->', marker)
+
+        return results
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+
+# ---------- CLI/ИНТЕРАКТИВ ----------
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Ищет 3D-ресурсы на странице, сохраняет модели и артефакты.')
+    # URL теперь НЕобязательный (если не передан — спросим интерактивно)
+    parser.add_argument('url', nargs='?', help='Page URL, например: https://yandex.ru/')
+    parser.add_argument('--out', default=DEFAULT_DOWNLOAD_FOLDER,
+                        help='Каталог вывода (абс./относительный путь, поддерживаются ~ и переменные окружения)')
+    parser.add_argument('--wait', type=int, default=DEFAULT_WAIT, help='Пауза ожидания динамического контента, сек')
+    parser.add_argument('--no-artifacts', action='store_true', help='Не сохранять HTML/список сетевых URL/манифест')
+    parser.add_argument('--no-empty-marker', action='store_true', help='Не создавать NO_3D_FOUND.txt при отсутствии 3D')
+
+    args = parser.parse_args()
+
+    url = args.url
+    if not url:
+        # Интерактивный режим, если URL не передан
+        url = input('Page URL: ').strip()
+
+    if not url:
+        print('URL не указан — работа прекращена.')
+    else:
+        files = parse_dynamic_page(
+            url,
+            out_folder=args.out,
+            wait=args.wait,
+            save_artifacts=not args.no_artifacts,
+            marker_on_empty=not args.no_empty_marker,
+        )
+        print('\nГотово. Сохранено файлов:', len(files))
+        for p in files:
+            print(' -', p)
 
 from seleniumwire import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -339,4 +452,3 @@ if __name__ == '__main__':
         print('\nГотово. Сохранено файлов:', len(files))
         for p in files:
             print(' -', p)
-            
